@@ -75,6 +75,8 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	to := sdktranslator.FromString("antigravity")
 	translated := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
 
+	translated = applyThinkingMetadataCLI(translated, req.Metadata, req.Model)
+
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 
@@ -165,6 +167,8 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("antigravity")
 	translated := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
+
+	translated = applyThinkingMetadataCLI(translated, req.Metadata, req.Model)
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -365,13 +369,27 @@ func FetchAntigravityModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *c
 		for id := range result.Map() {
 			id = modelName2Alias(id)
 			if id != "" {
-				models = append(models, &registry.ModelInfo{
-					ID:      id,
-					Object:  "model",
-					Created: now,
-					OwnedBy: antigravityAuthType,
-					Type:    antigravityAuthType,
-				})
+				modelInfo := &registry.ModelInfo{
+					ID:          id,
+					Name:        id,
+					Description: id,
+					DisplayName: id,
+					Version:     id,
+					Object:      "model",
+					Created:     now,
+					OwnedBy:     antigravityAuthType,
+					Type:        antigravityAuthType,
+				}
+				// Add Thinking support for thinking models
+				if strings.HasSuffix(id, "-thinking") || strings.Contains(id, "-thinking-") {
+					modelInfo.Thinking = &registry.ThinkingSupport{
+						Min:            1024,
+						Max:            100000,
+						ZeroAllowed:    false,
+						DynamicAllowed: true,
+					}
+				}
+				models = append(models, modelInfo)
 			}
 		}
 		return models
@@ -628,7 +646,7 @@ func antigravityBaseURLFallbackOrder(auth *cliproxyauth.Auth) []string {
 	return []string{
 		antigravityBaseURLDaily,
 		antigravityBaseURLAutopush,
-		// antigravityBaseURLProd,
+		antigravityBaseURLProd,
 	}
 }
 

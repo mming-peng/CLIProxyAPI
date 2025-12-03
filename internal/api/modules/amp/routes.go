@@ -6,11 +6,11 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/openai"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -37,7 +37,7 @@ func localhostOnlyMiddleware() gin.HandlerFunc {
 		// Parse the IP to handle both IPv4 and IPv6
 		ip := net.ParseIP(host)
 		if ip == nil {
-			log.Warnf("Amp management: invalid RemoteAddr %s, denying access", remoteAddr)
+			log.Warnf("amp management: invalid RemoteAddr %s, denying access", remoteAddr)
 			c.AbortWithStatusJSON(403, gin.H{
 				"error": "Access denied: management routes restricted to localhost",
 			})
@@ -46,7 +46,7 @@ func localhostOnlyMiddleware() gin.HandlerFunc {
 
 		// Check if IP is loopback (127.0.0.1 or ::1)
 		if !ip.IsLoopback() {
-			log.Warnf("Amp management: non-localhost connection from %s attempted access, denying", remoteAddr)
+			log.Warnf("amp management: non-localhost connection from %s attempted access, denying", remoteAddr)
 			c.AbortWithStatusJSON(403, gin.H{
 				"error": "Access denied: management routes restricted to localhost",
 			})
@@ -89,9 +89,9 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	// Apply localhost-only restriction if configured
 	if restrictToLocalhost {
 		ampAPI.Use(localhostOnlyMiddleware())
-		log.Info("Amp management routes restricted to localhost only (CORS disabled)")
+		log.Info("amp management routes restricted to localhost only (CORS disabled)")
 	} else {
-		log.Warn("⚠️  Amp management routes are NOT restricted to localhost - this is insecure!")
+		log.Warn("amp management routes are NOT restricted to localhost - this is insecure!")
 	}
 
 	// Management routes - these are proxied directly to Amp upstream
@@ -110,6 +110,14 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	ampAPI.Any("/threads/*path", proxyHandler)
 	ampAPI.Any("/otel", proxyHandler)
 	ampAPI.Any("/otel/*path", proxyHandler)
+
+	// Root-level routes that AMP CLI expects without /api prefix
+	// These need the same security middleware as the /api/* routes
+	rootMiddleware := []gin.HandlerFunc{noCORSMiddleware()}
+	if restrictToLocalhost {
+		rootMiddleware = append(rootMiddleware, localhostOnlyMiddleware())
+	}
+	engine.GET("/threads.rss", append(rootMiddleware, proxyHandler)...)
 
 	// Google v1beta1 passthrough with OAuth fallback
 	// AMP CLI uses non-standard paths like /publishers/google/models/...
@@ -162,9 +170,10 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 
 	// Create fallback handler wrapper that forwards to ampcode.com when provider not found
 	// Uses lazy evaluation to access proxy (which is created after routes are registered)
-	fallbackHandler := NewFallbackHandler(func() *httputil.ReverseProxy {
+	// Also includes model mapping support for routing unavailable models to alternatives
+	fallbackHandler := NewFallbackHandlerWithMapper(func() *httputil.ReverseProxy {
 		return m.proxy
-	})
+	}, m.modelMapper)
 
 	// Provider-specific routes under /api/provider/:provider
 	ampProviders := engine.Group("/api/provider")
