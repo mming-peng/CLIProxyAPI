@@ -944,7 +944,6 @@ func GetQwenModels() []*ModelInfo {
 }
 
 // GetIFlowModels returns supported models for iFlow OAuth accounts.
-
 func GetIFlowModels() []*ModelInfo {
 	entries := []struct {
 		ID          string
@@ -961,6 +960,7 @@ func GetIFlowModels() []*ModelInfo {
 		{ID: "glm-4.6", DisplayName: "GLM-4.6", Description: "Zhipu GLM 4.6 general model", Created: 1759190400},
 		{ID: "kimi-k2", DisplayName: "Kimi-K2", Description: "Moonshot Kimi K2 general model", Created: 1752192000},
 		{ID: "kimi-k2-thinking", DisplayName: "Kimi-K2-Thinking", Description: "Moonshot Kimi K2 general model", Created: 1762387200},
+		{ID: "deepseek-v3.2-chat", DisplayName: "DeepSeek-V3.2", Description: "DeepSeek V3.2", Created: 1764576000},
 		{ID: "deepseek-v3.2", DisplayName: "DeepSeek-V3.2-Exp", Description: "DeepSeek V3.2 experimental", Created: 1759104000},
 		{ID: "deepseek-v3.1", DisplayName: "DeepSeek-V3.1-Terminus", Description: "DeepSeek V3.1 Terminus", Created: 1756339200},
 		{ID: "deepseek-r1", DisplayName: "DeepSeek-R1", Description: "DeepSeek reasoning model R1", Created: 1737331200},
@@ -984,4 +984,23 @@ func GetIFlowModels() []*ModelInfo {
 		})
 	}
 	return models
+}
+
+// AntigravityModelConfig captures static antigravity model overrides, including
+// Thinking budget limits and provider max completion tokens.
+type AntigravityModelConfig struct {
+	Thinking            *ThinkingSupport
+	MaxCompletionTokens int
+}
+
+// GetAntigravityModelConfig returns static configuration for antigravity models.
+// Keys use the ALIASED model names (after modelName2Alias conversion) for direct lookup.
+func GetAntigravityModelConfig() map[string]*AntigravityModelConfig {
+	return map[string]*AntigravityModelConfig{
+		"gemini-2.5-flash":                  {Thinking: &ThinkingSupport{Min: 0, Max: 24576, ZeroAllowed: true, DynamicAllowed: true}},
+		"gemini-2.5-flash-lite":             {Thinking: &ThinkingSupport{Min: 0, Max: 24576, ZeroAllowed: true, DynamicAllowed: true}},
+		"gemini-3-pro-preview":              {Thinking: &ThinkingSupport{Min: 128, Max: 32768, ZeroAllowed: false, DynamicAllowed: true}},
+		"gemini-claude-sonnet-4-5-thinking": {Thinking: &ThinkingSupport{Min: 1024, Max: 200000, ZeroAllowed: false, DynamicAllowed: true}, MaxCompletionTokens: 64000},
+		"gemini-claude-opus-4-5-thinking":   {Thinking: &ThinkingSupport{Min: 1024, Max: 200000, ZeroAllowed: false, DynamicAllowed: true}, MaxCompletionTokens: 64000},
+	}
 }

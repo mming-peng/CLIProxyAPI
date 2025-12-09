@@ -104,52 +104,6 @@ func (h *Handler) deleteFromStringList(c *gin.Context, target *[]string, after f
 	c.JSON(400, gin.H{"error": "missing index or value"})
 }
 
-func sanitizeStringSlice(in []string) []string {
-	out := make([]string, 0, len(in))
-	for i := range in {
-		if trimmed := strings.TrimSpace(in[i]); trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	return out
-}
-
-func geminiKeyStringsFromConfig(cfg *config.Config) []string {
-	if cfg == nil || len(cfg.GeminiKey) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(cfg.GeminiKey))
-	for i := range cfg.GeminiKey {
-		if key := strings.TrimSpace(cfg.GeminiKey[i].APIKey); key != "" {
-			out = append(out, key)
-		}
-	}
-	return out
-}
-
-func (h *Handler) applyLegacyKeys(keys []string) {
-	if h == nil || h.cfg == nil {
-		return
-	}
-	sanitized := sanitizeStringSlice(keys)
-	existing := make(map[string]config.GeminiKey, len(h.cfg.GeminiKey))
-	for _, entry := range h.cfg.GeminiKey {
-		if key := strings.TrimSpace(entry.APIKey); key != "" {
-			existing[key] = entry
-		}
-	}
-	newList := make([]config.GeminiKey, 0, len(sanitized))
-	for _, key := range sanitized {
-		if entry, ok := existing[key]; ok {
-			newList = append(newList, entry)
-		} else {
-			newList = append(newList, config.GeminiKey{APIKey: key})
-		}
-	}
-	h.cfg.GeminiKey = newList
-	h.cfg.SanitizeGeminiKeys()
-}
-
 // api-keys
 func (h *Handler) GetAPIKeys(c *gin.Context) { c.JSON(200, gin.H{"api-keys": h.cfg.APIKeys}) }
 func (h *Handler) PutAPIKeys(c *gin.Context) {
@@ -163,24 +117,6 @@ func (h *Handler) PatchAPIKeys(c *gin.Context) {
 }
 func (h *Handler) DeleteAPIKeys(c *gin.Context) {
 	h.deleteFromStringList(c, &h.cfg.APIKeys, func() { h.cfg.Access.Providers = nil })
-}
-
-// generative-language-api-key
-func (h *Handler) GetGlKeys(c *gin.Context) {
-	c.JSON(200, gin.H{"generative-language-api-key": geminiKeyStringsFromConfig(h.cfg)})
-}
-func (h *Handler) PutGlKeys(c *gin.Context) {
-	h.putStringList(c, func(v []string) {
-		h.applyLegacyKeys(v)
-	}, nil)
-}
-func (h *Handler) PatchGlKeys(c *gin.Context) {
-	target := append([]string(nil), geminiKeyStringsFromConfig(h.cfg)...)
-	h.patchStringList(c, &target, func() { h.applyLegacyKeys(target) })
-}
-func (h *Handler) DeleteGlKeys(c *gin.Context) {
-	target := append([]string(nil), geminiKeyStringsFromConfig(h.cfg)...)
-	h.deleteFromStringList(c, &target, func() { h.applyLegacyKeys(target) })
 }
 
 // gemini-api-key: []GeminiKey
@@ -769,4 +705,156 @@ func normalizeClaudeKey(entry *config.ClaudeKey) {
 		normalized = append(normalized, model)
 	}
 	entry.Models = normalized
+}
+
+// GetAmpCode returns the complete ampcode configuration.
+func (h *Handler) GetAmpCode(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(200, gin.H{"ampcode": config.AmpCode{}})
+		return
+	}
+	c.JSON(200, gin.H{"ampcode": h.cfg.AmpCode})
+}
+
+// GetAmpUpstreamURL returns the ampcode upstream URL.
+func (h *Handler) GetAmpUpstreamURL(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(200, gin.H{"upstream-url": ""})
+		return
+	}
+	c.JSON(200, gin.H{"upstream-url": h.cfg.AmpCode.UpstreamURL})
+}
+
+// PutAmpUpstreamURL updates the ampcode upstream URL.
+func (h *Handler) PutAmpUpstreamURL(c *gin.Context) {
+	h.updateStringField(c, func(v string) { h.cfg.AmpCode.UpstreamURL = strings.TrimSpace(v) })
+}
+
+// DeleteAmpUpstreamURL clears the ampcode upstream URL.
+func (h *Handler) DeleteAmpUpstreamURL(c *gin.Context) {
+	h.cfg.AmpCode.UpstreamURL = ""
+	h.persist(c)
+}
+
+// GetAmpUpstreamAPIKey returns the ampcode upstream API key.
+func (h *Handler) GetAmpUpstreamAPIKey(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(200, gin.H{"upstream-api-key": ""})
+		return
+	}
+	c.JSON(200, gin.H{"upstream-api-key": h.cfg.AmpCode.UpstreamAPIKey})
+}
+
+// PutAmpUpstreamAPIKey updates the ampcode upstream API key.
+func (h *Handler) PutAmpUpstreamAPIKey(c *gin.Context) {
+	h.updateStringField(c, func(v string) { h.cfg.AmpCode.UpstreamAPIKey = strings.TrimSpace(v) })
+}
+
+// DeleteAmpUpstreamAPIKey clears the ampcode upstream API key.
+func (h *Handler) DeleteAmpUpstreamAPIKey(c *gin.Context) {
+	h.cfg.AmpCode.UpstreamAPIKey = ""
+	h.persist(c)
+}
+
+// GetAmpRestrictManagementToLocalhost returns the localhost restriction setting.
+func (h *Handler) GetAmpRestrictManagementToLocalhost(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(200, gin.H{"restrict-management-to-localhost": true})
+		return
+	}
+	c.JSON(200, gin.H{"restrict-management-to-localhost": h.cfg.AmpCode.RestrictManagementToLocalhost})
+}
+
+// PutAmpRestrictManagementToLocalhost updates the localhost restriction setting.
+func (h *Handler) PutAmpRestrictManagementToLocalhost(c *gin.Context) {
+	h.updateBoolField(c, func(v bool) { h.cfg.AmpCode.RestrictManagementToLocalhost = v })
+}
+
+// GetAmpModelMappings returns the ampcode model mappings.
+func (h *Handler) GetAmpModelMappings(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(200, gin.H{"model-mappings": []config.AmpModelMapping{}})
+		return
+	}
+	c.JSON(200, gin.H{"model-mappings": h.cfg.AmpCode.ModelMappings})
+}
+
+// PutAmpModelMappings replaces all ampcode model mappings.
+func (h *Handler) PutAmpModelMappings(c *gin.Context) {
+	var body struct {
+		Value []config.AmpModelMapping `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	h.cfg.AmpCode.ModelMappings = body.Value
+	h.persist(c)
+}
+
+// PatchAmpModelMappings adds or updates model mappings.
+func (h *Handler) PatchAmpModelMappings(c *gin.Context) {
+	var body struct {
+		Value []config.AmpModelMapping `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	existing := make(map[string]int)
+	for i, m := range h.cfg.AmpCode.ModelMappings {
+		existing[strings.TrimSpace(m.From)] = i
+	}
+
+	for _, newMapping := range body.Value {
+		from := strings.TrimSpace(newMapping.From)
+		if idx, ok := existing[from]; ok {
+			h.cfg.AmpCode.ModelMappings[idx] = newMapping
+		} else {
+			h.cfg.AmpCode.ModelMappings = append(h.cfg.AmpCode.ModelMappings, newMapping)
+			existing[from] = len(h.cfg.AmpCode.ModelMappings) - 1
+		}
+	}
+	h.persist(c)
+}
+
+// DeleteAmpModelMappings removes specified model mappings by "from" field.
+func (h *Handler) DeleteAmpModelMappings(c *gin.Context) {
+	var body struct {
+		Value []string `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || len(body.Value) == 0 {
+		h.cfg.AmpCode.ModelMappings = nil
+		h.persist(c)
+		return
+	}
+
+	toRemove := make(map[string]bool)
+	for _, from := range body.Value {
+		toRemove[strings.TrimSpace(from)] = true
+	}
+
+	newMappings := make([]config.AmpModelMapping, 0, len(h.cfg.AmpCode.ModelMappings))
+	for _, m := range h.cfg.AmpCode.ModelMappings {
+		if !toRemove[strings.TrimSpace(m.From)] {
+			newMappings = append(newMappings, m)
+		}
+	}
+	h.cfg.AmpCode.ModelMappings = newMappings
+	h.persist(c)
+}
+
+// GetAmpForceModelMappings returns whether model mappings are forced.
+func (h *Handler) GetAmpForceModelMappings(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(200, gin.H{"force-model-mappings": false})
+		return
+	}
+	c.JSON(200, gin.H{"force-model-mappings": h.cfg.AmpCode.ForceModelMappings})
+}
+
+// PutAmpForceModelMappings updates the force model mappings setting.
+func (h *Handler) PutAmpForceModelMappings(c *gin.Context) {
+	h.updateBoolField(c, func(v bool) { h.cfg.AmpCode.ForceModelMappings = v })
 }

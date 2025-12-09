@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -76,6 +77,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	translated := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
 
 	translated = applyThinkingMetadataCLI(translated, req.Metadata, req.Model)
+	translated = normalizeAntigravityThinking(req.Model, translated)
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -169,6 +171,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	translated := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 
 	translated = applyThinkingMetadataCLI(translated, req.Metadata, req.Model)
+	translated = normalizeAntigravityThinking(req.Model, translated)
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -365,28 +368,29 @@ func FetchAntigravityModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *c
 		}
 
 		now := time.Now().Unix()
+		modelConfig := registry.GetAntigravityModelConfig()
 		models := make([]*registry.ModelInfo, 0, len(result.Map()))
-		for id := range result.Map() {
-			id = modelName2Alias(id)
-			if id != "" {
+		for originalName := range result.Map() {
+			aliasName := modelName2Alias(originalName)
+			if aliasName != "" {
 				modelInfo := &registry.ModelInfo{
-					ID:          id,
-					Name:        id,
-					Description: id,
-					DisplayName: id,
-					Version:     id,
+					ID:          aliasName,
+					Name:        aliasName,
+					Description: aliasName,
+					DisplayName: aliasName,
+					Version:     aliasName,
 					Object:      "model",
 					Created:     now,
 					OwnedBy:     antigravityAuthType,
 					Type:        antigravityAuthType,
 				}
-				// Add Thinking support for thinking models
-				if strings.HasSuffix(id, "-thinking") || strings.Contains(id, "-thinking-") {
-					modelInfo.Thinking = &registry.ThinkingSupport{
-						Min:            1024,
-						Max:            100000,
-						ZeroAllowed:    false,
-						DynamicAllowed: true,
+				// Look up Thinking support from static config using alias name
+				if cfg, ok := modelConfig[aliasName]; ok {
+					if cfg.Thinking != nil {
+						modelInfo.Thinking = cfg.Thinking
+					}
+					if cfg.MaxCompletionTokens > 0 {
+						modelInfo.MaxCompletionTokens = cfg.MaxCompletionTokens
 					}
 				}
 				models = append(models, modelInfo)
@@ -508,8 +512,47 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		requestURL.WriteString(url.QueryEscape(alt))
 	}
 
-	payload = geminiToAntigravity(modelName, payload)
+	// Extract project_id from auth metadata if available
+	projectID := ""
+	if auth != nil && auth.Metadata != nil {
+		if pid, ok := auth.Metadata["project_id"].(string); ok {
+			projectID = strings.TrimSpace(pid)
+		}
+	}
+	payload = geminiToAntigravity(modelName, payload, projectID)
 	payload, _ = sjson.SetBytes(payload, "model", alias2ModelName(modelName))
+
+	if strings.Contains(modelName, "claude") {
+		strJSON := string(payload)
+		paths := make([]string, 0)
+		util.Walk(gjson.ParseBytes(payload), "", "parametersJsonSchema", &paths)
+		for _, p := range paths {
+			strJSON, _ = util.RenameKey(strJSON, p, p[:len(p)-len("parametersJsonSchema")]+"parameters")
+		}
+
+		strJSON = util.DeleteKey(strJSON, "$schema")
+		strJSON = util.DeleteKey(strJSON, "maxItems")
+		strJSON = util.DeleteKey(strJSON, "minItems")
+		strJSON = util.DeleteKey(strJSON, "minLength")
+		strJSON = util.DeleteKey(strJSON, "maxLength")
+		strJSON = util.DeleteKey(strJSON, "exclusiveMinimum")
+		strJSON = util.DeleteKey(strJSON, "exclusiveMaximum")
+
+		paths = make([]string, 0)
+		util.Walk(gjson.Parse(strJSON), "", "anyOf", &paths)
+		for _, p := range paths {
+			anyOf := gjson.Get(strJSON, p)
+			if anyOf.IsArray() {
+				anyOfItems := anyOf.Array()
+				if len(anyOfItems) > 0 {
+					strJSON, _ = sjson.SetRaw(strJSON, p[:len(p)-len(".anyOf")], anyOfItems[0].Raw)
+				}
+			}
+		}
+
+		payload = []byte(strJSON)
+	}
+
 	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(payload))
 	if errReq != nil {
 		return nil, errReq
@@ -670,16 +713,22 @@ func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
 	return ""
 }
 
-func geminiToAntigravity(modelName string, payload []byte) []byte {
+func geminiToAntigravity(modelName string, payload []byte, projectID string) []byte {
 	template, _ := sjson.Set(string(payload), "model", modelName)
 	template, _ = sjson.Set(template, "userAgent", "antigravity")
-	template, _ = sjson.Set(template, "project", generateProjectID())
+
+	// Use real project ID from auth if available, otherwise generate random (legacy fallback)
+	if projectID != "" {
+		template, _ = sjson.Set(template, "project", projectID)
+	} else {
+		template, _ = sjson.Set(template, "project", generateProjectID())
+	}
 	template, _ = sjson.Set(template, "requestId", generateRequestID())
 	template, _ = sjson.Set(template, "request.sessionId", generateSessionID())
 
 	template, _ = sjson.Delete(template, "request.safetySettings")
 	template, _ = sjson.Set(template, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
-	template, _ = sjson.Delete(template, "request.generationConfig.maxOutputTokens")
+
 	if !strings.HasPrefix(modelName, "gemini-3-") {
 		if thinkingLevel := gjson.Get(template, "request.generationConfig.thinkingConfig.thinkingLevel"); thinkingLevel.Exists() {
 			template, _ = sjson.Delete(template, "request.generationConfig.thinkingConfig.thinkingLevel")
@@ -687,7 +736,7 @@ func geminiToAntigravity(modelName string, payload []byte) []byte {
 		}
 	}
 
-	if strings.HasPrefix(modelName, "claude-sonnet-") {
+	if strings.Contains(modelName, "claude") {
 		gjson.Get(template, "request.tools").ForEach(func(key, tool gjson.Result) bool {
 			tool.Get("functionDeclarations").ForEach(func(funKey, funcDecl gjson.Result) bool {
 				if funcDecl.Get("parametersJsonSchema").Exists() {
@@ -699,6 +748,8 @@ func geminiToAntigravity(modelName string, payload []byte) []byte {
 			})
 			return true
 		})
+	} else {
+		template, _ = sjson.Delete(template, "request.generationConfig.maxOutputTokens")
 	}
 
 	return []byte(template)
@@ -734,6 +785,8 @@ func modelName2Alias(modelName string) string {
 		return "gemini-claude-sonnet-4-5"
 	case "claude-sonnet-4-5-thinking":
 		return "gemini-claude-sonnet-4-5-thinking"
+	case "claude-opus-4-5-thinking":
+		return "gemini-claude-opus-4-5-thinking"
 	case "chat_20706", "chat_23310", "gemini-2.5-flash-thinking", "gemini-3-pro-low", "gemini-2.5-pro":
 		return ""
 	default:
@@ -753,7 +806,59 @@ func alias2ModelName(modelName string) string {
 		return "claude-sonnet-4-5"
 	case "gemini-claude-sonnet-4-5-thinking":
 		return "claude-sonnet-4-5-thinking"
+	case "gemini-claude-opus-4-5-thinking":
+		return "claude-opus-4-5-thinking"
 	default:
 		return modelName
 	}
+}
+
+// normalizeAntigravityThinking clamps or removes thinking config based on model support.
+// For Claude models, it additionally ensures thinking budget < max_tokens.
+func normalizeAntigravityThinking(model string, payload []byte) []byte {
+	payload = util.StripThinkingConfigIfUnsupported(model, payload)
+	if !util.ModelSupportsThinking(model) {
+		return payload
+	}
+	budget := gjson.GetBytes(payload, "request.generationConfig.thinkingConfig.thinkingBudget")
+	if !budget.Exists() {
+		return payload
+	}
+	raw := int(budget.Int())
+	normalized := util.NormalizeThinkingBudget(model, raw)
+
+	isClaude := strings.Contains(strings.ToLower(model), "claude")
+	if isClaude {
+		effectiveMax, setDefaultMax := antigravityEffectiveMaxTokens(model, payload)
+		if effectiveMax > 0 && normalized >= effectiveMax {
+			normalized = effectiveMax - 1
+			if normalized < 1 {
+				normalized = 1
+			}
+		}
+		if setDefaultMax {
+			if res, errSet := sjson.SetBytes(payload, "request.generationConfig.maxOutputTokens", effectiveMax); errSet == nil {
+				payload = res
+			}
+		}
+	}
+
+	updated, err := sjson.SetBytes(payload, "request.generationConfig.thinkingConfig.thinkingBudget", normalized)
+	if err != nil {
+		return payload
+	}
+	return updated
+}
+
+// antigravityEffectiveMaxTokens returns the max tokens to cap thinking:
+// prefer request-provided maxOutputTokens; otherwise fall back to model default.
+// The boolean indicates whether the value came from the model default (and thus should be written back).
+func antigravityEffectiveMaxTokens(model string, payload []byte) (max int, fromModel bool) {
+	if maxTok := gjson.GetBytes(payload, "request.generationConfig.maxOutputTokens"); maxTok.Exists() && maxTok.Int() > 0 {
+		return int(maxTok.Int()), false
+	}
+	if modelInfo := registry.GetGlobalRegistry().GetModelInfo(model); modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
+		return modelInfo.MaxCompletionTokens, true
+	}
+	return 0, false
 }
