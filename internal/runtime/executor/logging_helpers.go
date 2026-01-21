@@ -157,7 +157,7 @@ func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 	if ginCtx == nil {
 		return
 	}
-	_, attempt := ensureAttempt(ginCtx)
+	attempts, attempt := ensureAttempt(ginCtx)
 	ensureResponseIntro(attempt)
 
 	if !attempt.headersWritten {
@@ -175,6 +175,8 @@ func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 	}
 	attempt.response.WriteString(string(data))
 	attempt.bodyHasContent = true
+
+	updateAggregatedResponse(ginCtx, attempts)
 }
 
 func ginContextFrom(ctx context.Context) *gin.Context {
@@ -302,11 +304,7 @@ func formatAuthInfo(info upstreamRequestLog) string {
 			parts = append(parts, "type=api_key")
 		}
 	case "oauth":
-		if authValue != "" {
-			parts = append(parts, fmt.Sprintf("type=oauth account=%s", authValue))
-		} else {
-			parts = append(parts, "type=oauth")
-		}
+		parts = append(parts, "type=oauth")
 	default:
 		if authType != "" {
 			if authValue != "" {

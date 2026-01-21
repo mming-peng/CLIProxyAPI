@@ -146,6 +146,9 @@ func TestAmpModule_OnConfigUpdated_CacheInvalidation(t *testing.T) {
 	m := &AmpModule{enabled: true}
 	ms := NewMultiSourceSecretWithPath("", p, time.Minute)
 	m.secretSource = ms
+	m.lastConfig = &config.AmpCode{
+		UpstreamAPIKey: "old-key",
+	}
 
 	// Warm the cache
 	if _, err := ms.Get(context.Background()); err != nil {
@@ -157,7 +160,7 @@ func TestAmpModule_OnConfigUpdated_CacheInvalidation(t *testing.T) {
 	}
 
 	// Update config - should invalidate cache
-	if err := m.OnConfigUpdated(&config.Config{AmpCode: config.AmpCode{UpstreamURL: "http://x"}}); err != nil {
+	if err := m.OnConfigUpdated(&config.Config{AmpCode: config.AmpCode{UpstreamURL: "http://x", UpstreamAPIKey: "new-key"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -307,5 +310,43 @@ func TestAmpModule_ProviderAliasesAlwaysRegistered(t *testing.T) {
 				t.Fatal("provider aliases should be registered")
 			}
 		})
+	}
+}
+
+func TestAmpModule_hasUpstreamAPIKeysChanged_DetectsRemovedKeyWithDuplicateInput(t *testing.T) {
+	m := &AmpModule{}
+
+	oldCfg := &config.AmpCode{
+		UpstreamAPIKeys: []config.AmpUpstreamAPIKeyEntry{
+			{UpstreamAPIKey: "u1", APIKeys: []string{"k1", "k2"}},
+		},
+	}
+	newCfg := &config.AmpCode{
+		UpstreamAPIKeys: []config.AmpUpstreamAPIKeyEntry{
+			{UpstreamAPIKey: "u1", APIKeys: []string{"k1", "k1"}},
+		},
+	}
+
+	if !m.hasUpstreamAPIKeysChanged(oldCfg, newCfg) {
+		t.Fatal("expected change to be detected when k2 is removed but new list contains duplicates")
+	}
+}
+
+func TestAmpModule_hasUpstreamAPIKeysChanged_IgnoresEmptyAndWhitespaceKeys(t *testing.T) {
+	m := &AmpModule{}
+
+	oldCfg := &config.AmpCode{
+		UpstreamAPIKeys: []config.AmpUpstreamAPIKeyEntry{
+			{UpstreamAPIKey: "u1", APIKeys: []string{"k1", "k2"}},
+		},
+	}
+	newCfg := &config.AmpCode{
+		UpstreamAPIKeys: []config.AmpUpstreamAPIKeyEntry{
+			{UpstreamAPIKey: "u1", APIKeys: []string{"  k1  ", "", "k2", "   "}},
+		},
+	}
+
+	if m.hasUpstreamAPIKeysChanged(oldCfg, newCfg) {
+		t.Fatal("expected no change when only whitespace/empty entries differ")
 	}
 }

@@ -2,6 +2,7 @@ package responses
 
 import (
 	"bytes"
+	"strings"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -64,7 +65,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			}
 
 			switch itemType {
-			case "message":
+			case "message", "":
 				// Handle regular message conversion
 				role := item.Get("role").String()
 				message := `{"role":"","content":""}`
@@ -106,6 +107,8 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					if len(toolCalls) > 0 {
 						message, _ = sjson.Set(message, "tool_calls", toolCalls)
 					}
+				} else if content.Type == gjson.String {
+					message, _ = sjson.Set(message, "content", content.String())
 				}
 
 				out, _ = sjson.SetRaw(out, "messages.-1", message)
@@ -160,6 +163,14 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		var chatCompletionsTools []interface{}
 
 		tools.ForEach(func(_, tool gjson.Result) bool {
+			// Built-in tools (e.g. {"type":"web_search"}) are already compatible with the Chat Completions schema.
+			// Only function tools need structural conversion because Chat Completions nests details under "function".
+			toolType := tool.Get("type").String()
+			if toolType != "" && toolType != "function" && tool.IsObject() {
+				chatCompletionsTools = append(chatCompletionsTools, tool.Value())
+				return true
+			}
+
 			chatTool := `{"type":"function","function":{}}`
 
 			// Convert tool structure from responses format to chat completions format
@@ -189,23 +200,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	if reasoningEffort := root.Get("reasoning.effort"); reasoningEffort.Exists() {
-		switch reasoningEffort.String() {
-		case "none":
-			out, _ = sjson.Set(out, "reasoning_effort", "none")
-		case "auto":
-			out, _ = sjson.Set(out, "reasoning_effort", "auto")
-		case "minimal":
-			out, _ = sjson.Set(out, "reasoning_effort", "low")
-		case "low":
-			out, _ = sjson.Set(out, "reasoning_effort", "low")
-		case "medium":
-			out, _ = sjson.Set(out, "reasoning_effort", "medium")
-		case "high":
-			out, _ = sjson.Set(out, "reasoning_effort", "high")
-		case "xhigh":
-			out, _ = sjson.Set(out, "reasoning_effort", "xhigh")
-		default:
-			out, _ = sjson.Set(out, "reasoning_effort", "auto")
+		effort := strings.ToLower(strings.TrimSpace(reasoningEffort.String()))
+		if effort != "" {
+			out, _ = sjson.Set(out, "reasoning_effort", effort)
 		}
 	}
 

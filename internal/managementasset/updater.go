@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,10 +24,11 @@ import (
 )
 
 const (
-	managementReleaseURL = "https://api.github.com/repos/router-for-me/Cli-Proxy-API-Management-Center/releases/latest"
-	managementAssetName  = "management.html"
-	httpUserAgent        = "CLIProxyAPI-management-updater"
-	updateCheckInterval  = 3 * time.Hour
+	defaultManagementReleaseURL  = "https://api.github.com/repos/router-for-me/Cli-Proxy-API-Management-Center/releases/latest"
+	defaultManagementFallbackURL = "https://cpamc.router-for.me/"
+	managementAssetName          = "management.html"
+	httpUserAgent                = "CLIProxyAPI-management-updater"
+	updateCheckInterval          = 3 * time.Hour
 )
 
 // ManagementFileName exposes the control panel asset filename.
@@ -97,7 +99,7 @@ func runAutoUpdater(ctx context.Context) {
 
 		configPath, _ := schedulerConfigPath.Load().(string)
 		staticDir := StaticDir(configPath)
-		EnsureLatestManagementHTML(ctx, staticDir, cfg.ProxyURL)
+		EnsureLatestManagementHTML(ctx, staticDir, cfg.ProxyURL, cfg.RemoteManagement.PanelGitHubRepository)
 	}
 
 	runOnce()
@@ -181,7 +183,7 @@ func FilePath(configFilePath string) string {
 // EnsureLatestManagementHTML checks the latest management.html asset and updates the local copy when needed.
 // The function is designed to run in a background goroutine and will never panic.
 // It enforces a 3-hour rate limit to avoid frequent checks on config/auth file changes.
-func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL string) {
+func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL string, panelRepository string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -197,6 +199,16 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		return
 	}
 
+	localPath := filepath.Join(staticDir, managementAssetName)
+	localFileMissing := false
+	if _, errStat := os.Stat(localPath); errStat != nil {
+		if errors.Is(errStat, os.ErrNotExist) {
+			localFileMissing = true
+		} else {
+			log.WithError(errStat).Debug("failed to stat local management asset")
+		}
+	}
+
 	// Rate limiting: check only once every 3 hours
 	lastUpdateCheckMu.Lock()
 	now := time.Now()
@@ -209,14 +221,14 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 	lastUpdateCheckTime = now
 	lastUpdateCheckMu.Unlock()
 
-	if err := os.MkdirAll(staticDir, 0o755); err != nil {
-		log.WithError(err).Warn("failed to prepare static directory for management asset")
+	if errMkdirAll := os.MkdirAll(staticDir, 0o755); errMkdirAll != nil {
+		log.WithError(errMkdirAll).Warn("failed to prepare static directory for management asset")
 		return
 	}
 
+	releaseURL := resolveReleaseURL(panelRepository)
 	client := newHTTPClient(proxyURL)
 
-	localPath := filepath.Join(staticDir, managementAssetName)
 	localHash, err := fileSHA256(localPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -225,8 +237,15 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		localHash = ""
 	}
 
-	asset, remoteHash, err := fetchLatestAsset(ctx, client)
+	asset, remoteHash, err := fetchLatestAsset(ctx, client, releaseURL)
 	if err != nil {
+		if localFileMissing {
+			log.WithError(err).Warn("failed to fetch latest management release information, trying fallback page")
+			if ensureFallbackManagementHTML(ctx, client, localPath) {
+				return
+			}
+			return
+		}
 		log.WithError(err).Warn("failed to fetch latest management release information")
 		return
 	}
@@ -238,6 +257,13 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 
 	data, downloadedHash, err := downloadAsset(ctx, client, asset.BrowserDownloadURL)
 	if err != nil {
+		if localFileMissing {
+			log.WithError(err).Warn("failed to download management asset, trying fallback page")
+			if ensureFallbackManagementHTML(ctx, client, localPath) {
+				return
+			}
+			return
+		}
 		log.WithError(err).Warn("failed to download management asset")
 		return
 	}
@@ -254,8 +280,60 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 	log.Infof("management asset updated successfully (hash=%s)", downloadedHash)
 }
 
-func fetchLatestAsset(ctx context.Context, client *http.Client) (*releaseAsset, string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, managementReleaseURL, nil)
+func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, localPath string) bool {
+	data, downloadedHash, err := downloadAsset(ctx, client, defaultManagementFallbackURL)
+	if err != nil {
+		log.WithError(err).Warn("failed to download fallback management control panel page")
+		return false
+	}
+
+	if err = atomicWriteFile(localPath, data); err != nil {
+		log.WithError(err).Warn("failed to persist fallback management control panel page")
+		return false
+	}
+
+	log.Infof("management asset updated from fallback page successfully (hash=%s)", downloadedHash)
+	return true
+}
+
+func resolveReleaseURL(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return defaultManagementReleaseURL
+	}
+
+	parsed, err := url.Parse(repo)
+	if err != nil || parsed.Host == "" {
+		return defaultManagementReleaseURL
+	}
+
+	host := strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+
+	if host == "api.github.com" {
+		if !strings.HasSuffix(strings.ToLower(parsed.Path), "/releases/latest") {
+			parsed.Path = parsed.Path + "/releases/latest"
+		}
+		return parsed.String()
+	}
+
+	if host == "github.com" {
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+			repoName := strings.TrimSuffix(parts[1], ".git")
+			return fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", parts[0], repoName)
+		}
+	}
+
+	return defaultManagementReleaseURL
+}
+
+func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL string) (*releaseAsset, string, error) {
+	if strings.TrimSpace(releaseURL) == "" {
+		releaseURL = defaultManagementReleaseURL
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, releaseURL, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("create release request: %w", err)
 	}

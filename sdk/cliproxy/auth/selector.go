@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,11 @@ type RoundRobinSelector struct {
 	mu      sync.Mutex
 	cursors map[string]int
 }
+
+// FillFirstSelector selects the first available credential (deterministic ordering).
+// This "burns" one account before moving to the next, which can help stagger
+// rolling-window subscription caps (e.g. chat message limits).
+type FillFirstSelector struct{}
 
 type blockReason int
 
@@ -98,25 +104,29 @@ func (e *modelCooldownError) Headers() http.Header {
 	return headers
 }
 
-// Pick selects the next available auth for the provider in a round-robin manner.
-func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = ctx
-	_ = opts
-	if len(auths) == 0 {
-		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
+func authPriority(auth *Auth) int {
+	if auth == nil || auth.Attributes == nil {
+		return 0
 	}
-	if s.cursors == nil {
-		s.cursors = make(map[string]int)
+	raw := strings.TrimSpace(auth.Attributes["priority"])
+	if raw == "" {
+		return 0
 	}
-	available := make([]*Auth, 0, len(auths))
-	now := time.Now()
-	cooldownCount := 0
-	var earliest time.Time
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0
+	}
+	return parsed
+}
+
+func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
+	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
 		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
 		if !blocked {
-			available = append(available, candidate)
+			priority := authPriority(candidate)
+			available[priority] = append(available[priority], candidate)
 			continue
 		}
 		if reason == blockReasonCooldown {
@@ -126,22 +136,60 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 			}
 		}
 	}
-	if len(available) == 0 {
+	return available, cooldownCount, earliest
+}
+
+func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	if len(auths) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
+	}
+
+	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
+	if len(availableByPriority) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
+			providerForError := provider
+			if providerForError == "mixed" {
+				providerForError = ""
+			}
 			resetIn := earliest.Sub(now)
 			if resetIn < 0 {
 				resetIn = 0
 			}
-			return nil, newModelCooldownError(model, provider, resetIn)
+			return nil, newModelCooldownError(model, providerForError, resetIn)
 		}
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
-	// Make round-robin deterministic even if caller's candidate order is unstable.
+
+	bestPriority := 0
+	found := false
+	for priority := range availableByPriority {
+		if !found || priority > bestPriority {
+			bestPriority = priority
+			found = true
+		}
+	}
+
+	available := availableByPriority[bestPriority]
 	if len(available) > 1 {
 		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
 	}
+	return available, nil
+}
+
+// Pick selects the next available auth for the provider in a round-robin manner.
+func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	_ = ctx
+	_ = opts
+	now := time.Now()
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
 	key := provider + ":" + model
 	s.mu.Lock()
+	if s.cursors == nil {
+		s.cursors = make(map[string]int)
+	}
 	index := s.cursors[key]
 
 	if index >= 2_147_483_640 {
@@ -152,6 +200,18 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	s.mu.Unlock()
 	// log.Debugf("available: %d, index: %d, key: %d", len(available), index, index%len(available))
 	return available[index%len(available)], nil
+}
+
+// Pick selects the first available auth for the provider in a deterministic manner.
+func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	_ = ctx
+	_ = opts
+	now := time.Now()
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	return available[0], nil
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
