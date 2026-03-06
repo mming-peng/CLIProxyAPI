@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -62,20 +65,27 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
 
+	// metadataSetter is a private interface for TokenStorage implementations that support metadata injection.
+	type metadataSetter interface {
+		SetMetadata(map[string]any)
+	}
+
 	switch {
 	case auth.Storage != nil:
+		if setter, ok := auth.Storage.(metadataSetter); ok {
+			setter.SetMetadata(auth.Metadata)
+		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
 	case auth.Metadata != nil:
+		auth.Metadata["disabled"] = auth.Disabled
 		raw, errMarshal := json.Marshal(auth.Metadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 		}
 		if existing, errRead := os.ReadFile(path); errRead == nil {
-			// Use metadataEqualIgnoringTimestamps to skip writes when only timestamp fields change.
-			// This prevents the token refresh loop caused by timestamp/expired/expires_in changes.
-			if metadataEqualIgnoringTimestamps(existing, raw, auth.Provider) {
+			if jsonEqual(existing, raw) {
 				return path, nil
 			}
 			file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -187,15 +197,21 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if provider == "" {
 		provider = "unknown"
 	}
-	if provider == "antigravity" {
+	if provider == "antigravity" || provider == "gemini" {
 		projectID := ""
 		if pid, ok := metadata["project_id"].(string); ok {
 			projectID = strings.TrimSpace(pid)
 		}
 		if projectID == "" {
-			accessToken := ""
-			if token, ok := metadata["access_token"].(string); ok {
-				accessToken = strings.TrimSpace(token)
+			accessToken := extractAccessToken(metadata)
+			// For gemini type, the stored access_token is likely expired (~1h lifetime).
+			// Refresh it using the long-lived refresh_token before querying.
+			if provider == "gemini" {
+				if tokenMap, ok := metadata["token"].(map[string]any); ok {
+					if refreshed, errRefresh := refreshGeminiAccessToken(tokenMap, http.DefaultClient); errRefresh == nil {
+						accessToken = refreshed
+					}
+				}
 			}
 			if accessToken != "" {
 				fetchedProjectID, errFetch := FetchAntigravityProjectID(context.Background(), accessToken, http.DefaultClient)
@@ -216,12 +232,18 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 		return nil, fmt.Errorf("stat file: %w", err)
 	}
 	id := s.idFor(path, baseDir)
+	disabled, _ := metadata["disabled"].(bool)
+	status := cliproxyauth.StatusActive
+	if disabled {
+		status = cliproxyauth.StatusDisabled
+	}
 	auth := &cliproxyauth.Auth{
 		ID:               id,
 		Provider:         provider,
 		FileName:         id,
 		Label:            s.labelFor(metadata),
-		Status:           cliproxyauth.StatusActive,
+		Status:           status,
+		Disabled:         disabled,
 		Attributes:       map[string]string{"path": path},
 		Metadata:         metadata,
 		CreatedAt:        info.ModTime(),
@@ -236,14 +258,17 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 }
 
 func (s *FileTokenStore) idFor(path, baseDir string) string {
-	if baseDir == "" {
-		return path
+	id := path
+	if baseDir != "" {
+		if rel, errRel := filepath.Rel(baseDir, path); errRel == nil && rel != "" {
+			id = rel
+		}
 	}
-	rel, err := filepath.Rel(baseDir, path)
-	if err != nil {
-		return path
+	// On Windows, normalize ID casing to avoid duplicate auth entries caused by case-insensitive paths.
+	if runtime.GOOS == "windows" {
+		id = strings.ToLower(id)
 	}
-	return rel
+	return id
 }
 
 func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error) {
@@ -299,8 +324,68 @@ func (s *FileTokenStore) baseDirSnapshot() string {
 	return s.baseDir
 }
 
-// DEPRECATED: Use metadataEqualIgnoringTimestamps for comparing auth metadata.
-// This function is kept for backward compatibility but can cause refresh loops.
+func extractAccessToken(metadata map[string]any) string {
+	if at, ok := metadata["access_token"].(string); ok {
+		if v := strings.TrimSpace(at); v != "" {
+			return v
+		}
+	}
+	if tokenMap, ok := metadata["token"].(map[string]any); ok {
+		if at, ok := tokenMap["access_token"].(string); ok {
+			if v := strings.TrimSpace(at); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+func refreshGeminiAccessToken(tokenMap map[string]any, httpClient *http.Client) (string, error) {
+	refreshToken, _ := tokenMap["refresh_token"].(string)
+	clientID, _ := tokenMap["client_id"].(string)
+	clientSecret, _ := tokenMap["client_secret"].(string)
+	tokenURI, _ := tokenMap["token_uri"].(string)
+
+	if refreshToken == "" || clientID == "" || clientSecret == "" {
+		return "", fmt.Errorf("missing refresh credentials")
+	}
+	if tokenURI == "" {
+		tokenURI = "https://oauth2.googleapis.com/token"
+	}
+
+	data := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+		"client_id":     {clientID},
+		"client_secret": {clientSecret},
+	}
+
+	resp, err := httpClient.PostForm(tokenURI, data)
+	if err != nil {
+		return "", fmt.Errorf("refresh request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("refresh failed: status %d", resp.StatusCode)
+	}
+
+	var result map[string]any
+	if errUnmarshal := json.Unmarshal(body, &result); errUnmarshal != nil {
+		return "", fmt.Errorf("decode refresh response: %w", errUnmarshal)
+	}
+
+	newAccessToken, _ := result["access_token"].(string)
+	if newAccessToken == "" {
+		return "", fmt.Errorf("no access_token in refresh response")
+	}
+
+	tokenMap["access_token"] = newAccessToken
+	return newAccessToken, nil
+}
+
+// jsonEqual compares two JSON blobs by parsing them into Go objects and deep comparing.
 func jsonEqual(a, b []byte) bool {
 	var objA any
 	var objB any
@@ -310,41 +395,6 @@ func jsonEqual(a, b []byte) bool {
 	if err := json.Unmarshal(b, &objB); err != nil {
 		return false
 	}
-	return deepEqualJSON(objA, objB)
-}
-
-// metadataEqualIgnoringTimestamps compares two metadata JSON blobs,
-// ignoring fields that change on every refresh but don't affect functionality.
-// This prevents unnecessary file writes that would trigger watcher events and
-// create refresh loops.
-// The provider parameter controls whether access_token is ignored: providers like
-// Google OAuth (gemini, gemini-cli) can re-fetch tokens when needed, while others
-// like iFlow require the refreshed token to be persisted.
-func metadataEqualIgnoringTimestamps(a, b []byte, provider string) bool {
-	var objA, objB map[string]any
-	if err := json.Unmarshal(a, &objA); err != nil {
-		return false
-	}
-	if err := json.Unmarshal(b, &objB); err != nil {
-		return false
-	}
-
-	// Fields to ignore: these change on every refresh but don't affect authentication logic.
-	// - timestamp, expired, expires_in, last_refresh: time-related fields that change on refresh
-	ignoredFields := []string{"timestamp", "expired", "expires_in", "last_refresh"}
-
-	// For providers that can re-fetch tokens when needed (e.g., Google OAuth),
-	// we ignore access_token to avoid unnecessary file writes.
-	switch provider {
-	case "gemini", "gemini-cli", "antigravity":
-		ignoredFields = append(ignoredFields, "access_token")
-	}
-
-	for _, field := range ignoredFields {
-		delete(objA, field)
-		delete(objB, field)
-	}
-
 	return deepEqualJSON(objA, objB)
 }
 
